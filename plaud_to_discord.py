@@ -104,6 +104,46 @@ def download_audio(file_id):
     return mp3_path
 
 
+def rename_plaud_file(file_id, new_name):
+    """Plaud 上のファイル名を変更"""
+    url = f"{PLAUD_API_DOMAIN}/file/{file_id}"
+    resp = requests.patch(url, headers=HEADERS, json={"filename": new_name})
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != 0:
+        print(f"  [warn] リネーム失敗: {data}")
+        return False
+    print(f"  Plaud ファイル名変更: {new_name}")
+    return True
+
+
+def generate_title_gemini(transcript_text):
+    """Gemini で文字起こしから簡潔なタイトルを生成"""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+
+    prompt = f"""以下の会議の文字起こしの冒頭部分を読み、この会議の内容を表す簡潔なタイトルを1つだけ生成してください。
+
+## ルール
+- 「誰と何の話をしたか」が一目でわかるタイトルにする
+- 最大30文字以内
+- 参加者の名前がわかれば含める
+- 余計な説明や装飾は不要。タイトルのみ出力すること
+- 例: 「鈴木・田中: 新規事業の方向性」「チーム定例: Q1振り返り」「遼太郎: キャリア相談」
+
+## 文字起こし（冒頭部分）
+{transcript_text[:5000]}
+"""
+
+    response = model.generate_content(prompt)
+    title = response.text.strip().strip('"').strip("「").strip("」")
+    # 30文字制限
+    if len(title) > 30:
+        title = title[:30]
+    return title
+
+
 # === 文字起こし (Whisper) ===
 
 def split_audio(mp3_path):
@@ -291,17 +331,24 @@ def process_file(file_info):
     # 2. 文字起こし
     transcript = transcribe_audio(mp3_path, file_id)
 
-    # 3. アクション抽出 (Gemini)
+    # 3. タイトル生成 & Plaud リネーム
+    print("  タイトル生成中 (Gemini)...")
+    title = generate_title_gemini(transcript)
+    print(f"  生成タイトル: {title}")
+    rename_plaud_file(file_id, title)
+    display_name = f"{filename} - {title}"
+
+    # 4. アクション抽出 (Gemini)
     print("  アクション抽出中 (Gemini)...")
-    actions = extract_actions_gemini(transcript, filename)
+    actions = extract_actions_gemini(transcript, display_name)
     print("  アクション抽出完了")
 
     # 結果をファイルに保存
     result_path = TRANSCRIPT_DIR / f"{file_id}_actions.md"
-    result_path.write_text(f"# {filename}\n\n{actions}", encoding="utf-8")
+    result_path.write_text(f"# {display_name}\n\n{actions}", encoding="utf-8")
 
-    # 4. Discord 送信
-    send_to_discord(actions, title=filename)
+    # 5. Discord 送信
+    send_to_discord(actions, title=display_name)
 
     # 5. 音声ファイル削除（ディスク節約）
     if mp3_path.exists():
