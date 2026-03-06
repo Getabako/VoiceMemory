@@ -2,8 +2,8 @@ name: Process Plaud Recordings
 
 on:
   schedule:
-    # 毎日 JST 22:00 (UTC 13:00) に実行
-    - cron: '0 13 * * *'
+    # 毎日 JST 19:00 (UTC 10:00) に実行
+    - cron: '0 10 * * *'
   workflow_dispatch:  # 手動実行も可能
 
 jobs:
