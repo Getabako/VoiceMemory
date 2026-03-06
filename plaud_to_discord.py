@@ -130,6 +130,27 @@ def split_audio(mp3_path):
     return chunks
 
 
+def transcribe_chunk_with_retry(client, chunk_path, max_retries=3):
+    """1チャンクを文字起こし（リトライ付き）"""
+    for attempt in range(max_retries):
+        try:
+            with open(chunk_path, "rb") as f:
+                result = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language="ja",
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                )
+            return result
+        except Exception as e:
+            print(f"    [retry {attempt + 1}/{max_retries}] {type(e).__name__}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5 * (attempt + 1))
+            else:
+                raise
+
+
 def transcribe_audio(mp3_path, file_id):
     """Whisper API で文字起こし"""
     transcript_path = TRANSCRIPT_DIR / f"{file_id}.txt"
@@ -140,19 +161,18 @@ def transcribe_audio(mp3_path, file_id):
     from openai import OpenAI
     client = OpenAI(api_key=OPENAI_API_KEY)
 
+    # API キー検証
+    if not OPENAI_API_KEY or len(OPENAI_API_KEY) < 10:
+        raise Exception(f"OPENAI_API_KEY が無効です (長さ: {len(OPENAI_API_KEY)})")
+    print(f"  OpenAI API Key: {OPENAI_API_KEY[:8]}...{OPENAI_API_KEY[-4:]}")
+
     chunks = split_audio(mp3_path)
     lines = []
 
     for i, chunk_path in enumerate(chunks):
-        print(f"  文字起こし中... ({i + 1}/{len(chunks)})")
-        with open(chunk_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="ja",
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
-            )
+        chunk_size = chunk_path.stat().st_size / 1024 / 1024
+        print(f"  文字起こし中... ({i + 1}/{len(chunks)}, {chunk_size:.1f}MB)")
+        result = transcribe_chunk_with_retry(client, chunk_path)
         if hasattr(result, "segments") and result.segments:
             offset = i * CHUNK_DURATION_SEC
             for seg in result.segments:
@@ -310,15 +330,23 @@ def run_auto():
         print("✅ 新しいファイルはありません")
         return
 
-    print(f"📡 {len(new_files)} 件の新規ファイルを処理します\n")
+    # GitHub Actions の時間制限対策: 1回の実行で最大3件まで
+    MAX_PER_RUN = 3
+    if len(new_files) > MAX_PER_RUN:
+        print(f"📡 {len(new_files)} 件の新規ファイルあり（今回は最新 {MAX_PER_RUN} 件を処理）\n")
+        new_files = new_files[:MAX_PER_RUN]
+    else:
+        print(f"📡 {len(new_files)} 件の新規ファイルを処理します\n")
     for f in new_files:
         try:
             process_file(f)
         except Exception as e:
-            print(f"  [error] {f['filename']}: {e}")
-            # エラーでも続行
+            import traceback
+            tb = traceback.format_exc()
+            print(f"  [error] {f['filename']}: {type(e).__name__}: {e}")
+            print(tb)
             send_to_discord(
-                f"⚠️ 処理エラー: {f['filename']}\n```\n{e}\n```",
+                f"⚠️ 処理エラー: {f['filename']}\n```\n{type(e).__name__}: {e}\n```",
                 title="処理エラー通知",
             )
 
