@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""
+Plaud → Whisper 文字起こし → Gemini アクション抽出 → Discord 送信
+GitHub Actions での定期自動実行対応
+"""
+
+import os
+import sys
+import json
+import time
+import shutil
+import subprocess
+import requests
+from pathlib import Path
+
+# dotenv はローカル実行時のみ（GitHub Actions では不要）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# === 設定（GitHub Secrets / 環境変数から取得） ===
+PLAUD_API_DOMAIN = os.getenv("PLAUD_API_DOMAIN", "https://api-apne1.plaud.ai")
+PLAUD_BEARER_TOKEN = os.getenv("PLAUD_BEARER_TOKEN", "")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+BASE_DIR = Path(__file__).parent
+AUDIO_DIR = BASE_DIR / "audio_files"
+TRANSCRIPT_DIR = BASE_DIR / "transcripts"
+PROCESSED_FILE = BASE_DIR / "processed_ids.json"
+AUDIO_DIR.mkdir(exist_ok=True)
+TRANSCRIPT_DIR.mkdir(exist_ok=True)
+
+HEADERS = {
+    "Authorization": PLAUD_BEARER_TOKEN,
+    "Content-Type": "application/json",
+}
+
+CHUNK_DURATION_SEC = 600  # 10分ごとに分割
+MIN_DURATION_SEC = 300    # 5分未満の録音はスキップ
+
+
+# === 処理済みID管理 ===
+
+def load_processed_ids():
+    """処理済みファイルIDリストを読み込み"""
+    if PROCESSED_FILE.exists():
+        return set(json.loads(PROCESSED_FILE.read_text(encoding="utf-8")))
+    return set()
+
+
+def save_processed_id(file_id):
+    """処理済みIDを追加保存"""
+    ids = load_processed_ids()
+    ids.add(file_id)
+    PROCESSED_FILE.write_text(json.dumps(sorted(ids), ensure_ascii=False), encoding="utf-8")
+
+
+# === Plaud API ===
+
+def list_files(limit=100, skip=0):
+    """Plaud からファイル一覧を取得"""
+    url = f"{PLAUD_API_DOMAIN}/file/simple/web"
+    params = {
+        "skip": skip,
+        "limit": limit,
+        "is_trash": 0,
+        "sort_by": "edit_time",
+        "is_desc": "true",
+    }
+    resp = requests.get(url, headers=HEADERS, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != 0:
+        raise Exception(f"Plaud API error: {data}")
+    return data.get("data_file_list", [])
+
+
+def download_audio(file_id):
+    """音声ファイルをダウンロード"""
+    mp3_path = AUDIO_DIR / f"{file_id}.mp3"
+    if mp3_path.exists():
+        print(f"  [skip] ダウンロード済み")
+        return mp3_path
+
+    url = f"{PLAUD_API_DOMAIN}/file/temp-url/{file_id}?is_opus=0"
+    resp = requests.get(url, headers=HEADERS)
+    resp.raise_for_status()
+    temp_url = resp.json().get("temp_url")
+    if not temp_url:
+        raise Exception("ダウンロードURL取得失敗")
+
+    print(f"  ダウンロード中...")
+    resp = requests.get(temp_url, stream=True)
+    resp.raise_for_status()
+    with open(mp3_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    size_mb = mp3_path.stat().st_size / 1024 / 1024
+    print(f"  完了: {size_mb:.1f}MB")
+    return mp3_path
+
+
+# === 文字起こし (Whisper) ===
+
+def split_audio(mp3_path):
+    """25MB超のファイルを分割"""
+    if mp3_path.stat().st_size <= 25 * 1024 * 1024:
+        return [mp3_path]
+
+    print(f"  ファイル分割中...")
+    chunk_dir = mp3_path.parent / f"{mp3_path.stem}_chunks"
+    chunk_dir.mkdir(exist_ok=True)
+
+    subprocess.run(
+        [
+            "ffmpeg", "-i", str(mp3_path),
+            "-f", "segment",
+            "-segment_time", str(CHUNK_DURATION_SEC),
+            "-c", "copy", "-y",
+            str(chunk_dir / "chunk_%03d.mp3"),
+        ],
+        capture_output=True, check=True,
+    )
+    chunks = sorted(chunk_dir.glob("chunk_*.mp3"))
+    print(f"  {len(chunks)} チャンクに分割")
+    return chunks
+
+
+def transcribe_audio(mp3_path, file_id):
+    """Whisper API で文字起こし"""
+    transcript_path = TRANSCRIPT_DIR / f"{file_id}.txt"
+    if transcript_path.exists():
+        print(f"  [skip] 文字起こし済み")
+        return transcript_path.read_text(encoding="utf-8")
+
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    chunks = split_audio(mp3_path)
+    lines = []
+
+    for i, chunk_path in enumerate(chunks):
+        print(f"  文字起こし中... ({i + 1}/{len(chunks)})")
+        with open(chunk_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language="ja",
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
+        if hasattr(result, "segments") and result.segments:
+            offset = i * CHUNK_DURATION_SEC
+            for seg in result.segments:
+                t = int(seg.start + offset)
+                h, m, s = t // 3600, (t % 3600) // 60, t % 60
+                lines.append(f"[{h:02d}:{m:02d}:{s:02d}] {seg.text}")
+        else:
+            lines.append(result.text)
+
+    text = "\n".join(lines)
+    transcript_path.write_text(text, encoding="utf-8")
+    print(f"  文字起こし完了: {len(text)} 文字")
+
+    # チャンク削除
+    chunk_dir = mp3_path.parent / f"{mp3_path.stem}_chunks"
+    if chunk_dir.exists():
+        shutil.rmtree(chunk_dir)
+
+    return text
+
+
+# === アクション抽出 (Gemini) ===
+
+def extract_actions_gemini(transcript_text, filename):
+    """Gemini API で会議のアクションリストを抽出"""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+
+    prompt = f"""あなたは優秀な会議アシスタントです。以下の会議の文字起こしを分析し、結果を出力してください。
+
+## 出力ルール
+- 必ず日本語で出力すること
+- Discordで表示するため、Markdown形式で整形すること
+- 具体的なアクションが読み取れない場合でも、重要な議論・合意事項・次のステップをまとめること
+- 話者の名前が特定できる場合はその名前を使い、特定できない場合は「話者A」「話者B」のように区別すること
+
+## 出力形式
+
+### 📋 会議要約
+（会議の目的・主な内容を3〜5行で簡潔に）
+
+### ✅ アクションリスト
+**[名前/話者]**
+- [ ] アクション内容（期限があれば記載）
+
+**[名前/話者]**
+- [ ] アクション内容
+
+### 📌 決定事項
+- 決定内容1
+- 決定内容2
+
+### 💡 補足・注意点
+- 議論中に出た重要な懸念や気づき
+
+## 文字起こし（会議名: {filename}）
+{transcript_text[:80000]}
+"""
+
+    response = model.generate_content(prompt)
+    return response.text
+
+
+# === Discord 送信 ===
+
+def send_to_discord(text, title=""):
+    """Discord Webhook に送信"""
+    if not DISCORD_WEBHOOK_URL:
+        print("  [warn] DISCORD_WEBHOOK_URL 未設定")
+        print(text)
+        return False
+
+    header = f"## 🎙️ {title}\n" if title else ""
+    content = header + text
+
+    # 2000文字制限で分割
+    messages = []
+    while content:
+        if len(content) <= 2000:
+            messages.append(content)
+            break
+        pos = content[:2000].rfind("\n")
+        if pos == -1:
+            pos = 2000
+        messages.append(content[:pos])
+        content = content[pos:].lstrip("\n")
+
+    for i, msg in enumerate(messages):
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+        if resp.status_code not in (200, 204):
+            print(f"  [error] Discord: {resp.status_code} {resp.text}")
+            return False
+        if i < len(messages) - 1:
+            time.sleep(1)
+
+    print(f"  Discord送信完了 ({len(messages)}メッセージ)")
+    return True
+
+
+# === パイプライン ===
+
+def process_file(file_info):
+    """1ファイルの完全パイプライン: DL → 文字起こし → アクション抽出 → Discord"""
+    file_id = file_info["id"]
+    filename = file_info["filename"]
+    duration_min = file_info["duration"] / 1000 / 60
+
+    print(f"\n{'=' * 50}")
+    print(f"📁 {filename} ({duration_min:.0f}分)")
+    print(f"{'=' * 50}")
+
+    # 1. ダウンロード
+    mp3_path = download_audio(file_id)
+
+    # 2. 文字起こし
+    transcript = transcribe_audio(mp3_path, file_id)
+
+    # 3. アクション抽出 (Gemini)
+    print("  アクション抽出中 (Gemini)...")
+    actions = extract_actions_gemini(transcript, filename)
+    print("  アクション抽出完了")
+
+    # 結果をファイルに保存
+    result_path = TRANSCRIPT_DIR / f"{file_id}_actions.md"
+    result_path.write_text(f"# {filename}\n\n{actions}", encoding="utf-8")
+
+    # 4. Discord 送信
+    send_to_discord(actions, title=filename)
+
+    # 5. 音声ファイル削除（ディスク節約）
+    if mp3_path.exists():
+        mp3_path.unlink()
+        print(f"  音声ファイル削除済み")
+
+    # 6. 処理済みIDを記録
+    save_processed_id(file_id)
+
+    return actions
+
+
+def run_auto():
+    """自動実行: 未処理の新しいファイルだけ処理"""
+    print("🔄 新規ファイルチェック中...")
+    files = list_files(limit=50)
+    processed = load_processed_ids()
+
+    new_files = [
+        f for f in files
+        if f["id"] not in processed
+        and f["duration"] / 1000 >= MIN_DURATION_SEC  # 5分未満はスキップ
+    ]
+
+    if not new_files:
+        print("✅ 新しいファイルはありません")
+        return
+
+    print(f"📡 {len(new_files)} 件の新規ファイルを処理します\n")
+    for f in new_files:
+        try:
+            process_file(f)
+        except Exception as e:
+            print(f"  [error] {f['filename']}: {e}")
+            # エラーでも続行
+            send_to_discord(
+                f"⚠️ 処理エラー: {f['filename']}\n```\n{e}\n```",
+                title="処理エラー通知",
+            )
+
+    print("\n✅ 全処理完了")
+
+
+# === CLI ===
+
+def main():
+    if len(sys.argv) < 2:
+        print("使い方:")
+        print("  python3 plaud_to_discord.py auto               # 新規ファイル自動処理 (GitHub Actions用)")
+        print("  python3 plaud_to_discord.py list               # ファイル一覧")
+        print("  python3 plaud_to_discord.py process <id>       # 1件をフル処理 (DL→文字起こし→アクション→Discord)")
+        print("  python3 plaud_to_discord.py transcribe <id>    # 1件を文字起こしのみ")
+        print("  python3 plaud_to_discord.py discord <text>     # Discord にテスト送信")
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+
+    if cmd == "auto":
+        if not PLAUD_BEARER_TOKEN:
+            print("❌ PLAUD_BEARER_TOKEN が未設定"); sys.exit(1)
+        if not OPENAI_API_KEY:
+            print("❌ OPENAI_API_KEY が未設定"); sys.exit(1)
+        if not GEMINI_API_KEY:
+            print("❌ GEMINI_API_KEY が未設定"); sys.exit(1)
+        run_auto()
+
+    elif cmd == "list":
+        if not PLAUD_BEARER_TOKEN:
+            print("❌ PLAUD_BEARER_TOKEN が未設定"); sys.exit(1)
+        files = list_files(limit=200)
+        processed = load_processed_ids()
+        print(f"{'ID':<34} {'日時':<22} {'時間':>6}  {'状態'}")
+        print("-" * 80)
+        for f in files:
+            dur = f["duration"] / 1000 / 60
+            tid = f["id"]
+            status = "✅" if tid in processed else "❌"
+            print(f"{tid}  {f['filename']:<22} {dur:>5.0f}分  {status}")
+        print(f"\n合計: {len(files)} 件 (処理済み: {len(processed)}件)")
+
+    elif cmd == "process" and len(sys.argv) > 2:
+        if not PLAUD_BEARER_TOKEN or not OPENAI_API_KEY or not GEMINI_API_KEY:
+            print("❌ 必要な環境変数が未設定"); sys.exit(1)
+        file_id = sys.argv[2]
+        files = list_files(limit=200)
+        target = next((f for f in files if f["id"] == file_id), None)
+        if target:
+            process_file(target)
+        else:
+            print(f"❌ ファイルが見つかりません: {file_id}")
+
+    elif cmd == "transcribe" and len(sys.argv) > 2:
+        if not PLAUD_BEARER_TOKEN or not OPENAI_API_KEY:
+            print("❌ 必要な環境変数が未設定"); sys.exit(1)
+        file_id = sys.argv[2]
+        print(f"🎙️ 文字起こし開始: {file_id}")
+        mp3_path = download_audio(file_id)
+        transcribe_audio(mp3_path, file_id)
+
+    elif cmd == "discord":
+        text = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else "テスト送信"
+        send_to_discord(text)
+
+    else:
+        print(f"不明なコマンド: {cmd}")
+
+
+if __name__ == "__main__":
+    main()

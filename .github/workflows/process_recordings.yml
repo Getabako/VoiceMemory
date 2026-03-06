@@ -1,0 +1,44 @@
+name: Process Plaud Recordings
+
+on:
+  schedule:
+    # 毎日 JST 22:00 (UTC 13:00) に実行
+    - cron: '0 13 * * *'
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run auto processing
+        env:
+          PLAUD_API_DOMAIN: ${{ secrets.PLAUD_API_DOMAIN }}
+          PLAUD_BEARER_TOKEN: ${{ secrets.PLAUD_BEARER_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python plaud_to_discord.py auto
+
+      - name: Commit processed IDs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add processed_ids.json transcripts/
+          git diff --cached --quiet || git commit -m "Update processed recordings [skip ci]"
+          git push
