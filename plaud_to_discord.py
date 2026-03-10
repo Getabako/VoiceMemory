@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Plaud → Whisper 文字起こし → Gemini アクション抽出 → Discord 送信
+Plaud → Gemini 文字起こし → Gemini アクション抽出 → Discord 送信 → Google Drive 保存
 GitHub Actions での定期自動実行対応
 """
 
@@ -8,10 +8,9 @@ import os
 import sys
 import json
 import time
-import shutil
-import subprocess
 import requests
 from pathlib import Path
+from datetime import datetime
 
 # dotenv はローカル実行時のみ（GitHub Actions では不要）
 try:
@@ -24,8 +23,11 @@ except ImportError:
 PLAUD_API_DOMAIN = os.getenv("PLAUD_API_DOMAIN", "https://api-apne1.plaud.ai")
 PLAUD_BEARER_TOKEN = os.getenv("PLAUD_BEARER_TOKEN", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+GOOGLE_OAUTH_REFRESH_TOKEN = os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN", "")
 
 BASE_DIR = Path(__file__).parent
 AUDIO_DIR = BASE_DIR / "audio_files"
@@ -39,7 +41,6 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-CHUNK_DURATION_SEC = 600  # 10分ごとに分割
 MIN_DURATION_SEC = 300    # 5分未満の録音はスキップ
 
 
@@ -144,45 +145,43 @@ def generate_title_gemini(transcript_text):
     return title
 
 
-# === 文字起こし (Whisper) ===
+# === 文字起こし (Gemini) ===
 
-def split_audio(mp3_path):
-    """25MB超のファイルを分割"""
-    if mp3_path.stat().st_size <= 25 * 1024 * 1024:
-        return [mp3_path]
+def transcribe_with_gemini(mp3_path, max_retries=3):
+    """Gemini File API + generateContent で音声を文字起こし"""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
 
-    print(f"  ファイル分割中...")
-    chunk_dir = mp3_path.parent / f"{mp3_path.stem}_chunks"
-    chunk_dir.mkdir(exist_ok=True)
+    # File API でアップロード
+    print(f"  Gemini File API にアップロード中...")
+    uploaded = genai.upload_file(str(mp3_path), mime_type="audio/mpeg")
 
-    subprocess.run(
-        [
-            "ffmpeg", "-i", str(mp3_path),
-            "-f", "segment",
-            "-segment_time", str(CHUNK_DURATION_SEC),
-            "-c", "copy", "-y",
-            str(chunk_dir / "chunk_%03d.mp3"),
-        ],
-        capture_output=True, check=True,
-    )
-    chunks = sorted(chunk_dir.glob("chunk_*.mp3"))
-    print(f"  {len(chunks)} チャンクに分割")
-    return chunks
+    # アップロード完了を待つ
+    while uploaded.state.name == "PROCESSING":
+        time.sleep(2)
+        uploaded = genai.get_file(uploaded.name)
 
+    if uploaded.state.name == "FAILED":
+        raise Exception(f"Gemini ファイルアップロード失敗: {uploaded.state}")
 
-def transcribe_chunk_with_retry(client, chunk_path, max_retries=3):
-    """1チャンクを文字起こし（リトライ付き）"""
+    print(f"  アップロード完了: {uploaded.name}")
+
+    model = genai.GenerativeModel("gemini-2.0-flash")
+
+    prompt = """以下の音声ファイルを日本語で文字起こししてください。
+
+## ルール
+- タイムスタンプを付けてください（[HH:MM:SS] 形式）
+- 話者が変わったタイミングで改行してください
+- 聞き取れない箇所は（聞き取り不明）と記載してください
+- できるだけ正確に、発言内容をそのまま書き起こしてください
+- 「えー」「あのー」などのフィラーは省略して構いません
+"""
+
     for attempt in range(max_retries):
         try:
-            with open(chunk_path, "rb") as f:
-                result = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    language="ja",
-                    response_format="verbose_json",
-                    timestamp_granularities=["segment"],
-                )
-            return result
+            response = model.generate_content([prompt, uploaded])
+            return response.text
         except Exception as e:
             print(f"    [retry {attempt + 1}/{max_retries}] {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
@@ -190,46 +189,29 @@ def transcribe_chunk_with_retry(client, chunk_path, max_retries=3):
             else:
                 raise
 
+    # アップロード済みファイルを削除
+    try:
+        genai.delete_file(uploaded.name)
+    except Exception:
+        pass
+
 
 def transcribe_audio(mp3_path, file_id):
-    """Whisper API で文字起こし"""
+    """Gemini API で文字起こし"""
     transcript_path = TRANSCRIPT_DIR / f"{file_id}.txt"
     if transcript_path.exists():
         print(f"  [skip] 文字起こし済み")
         return transcript_path.read_text(encoding="utf-8")
 
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    if not GEMINI_API_KEY or len(GEMINI_API_KEY) < 10:
+        raise Exception(f"GEMINI_API_KEY が無効です (長さ: {len(GEMINI_API_KEY)})")
 
-    # API キー検証
-    if not OPENAI_API_KEY or len(OPENAI_API_KEY) < 10:
-        raise Exception(f"OPENAI_API_KEY が無効です (長さ: {len(OPENAI_API_KEY)})")
-    print(f"  OpenAI API Key: {OPENAI_API_KEY[:8]}...{OPENAI_API_KEY[-4:]}")
+    size_mb = mp3_path.stat().st_size / 1024 / 1024
+    print(f"  文字起こし中 (Gemini)... ({size_mb:.1f}MB)")
 
-    chunks = split_audio(mp3_path)
-    lines = []
-
-    for i, chunk_path in enumerate(chunks):
-        chunk_size = chunk_path.stat().st_size / 1024 / 1024
-        print(f"  文字起こし中... ({i + 1}/{len(chunks)}, {chunk_size:.1f}MB)")
-        result = transcribe_chunk_with_retry(client, chunk_path)
-        if hasattr(result, "segments") and result.segments:
-            offset = i * CHUNK_DURATION_SEC
-            for seg in result.segments:
-                t = int(seg.start + offset)
-                h, m, s = t // 3600, (t % 3600) // 60, t % 60
-                lines.append(f"[{h:02d}:{m:02d}:{s:02d}] {seg.text}")
-        else:
-            lines.append(result.text)
-
-    text = "\n".join(lines)
+    text = transcribe_with_gemini(mp3_path)
     transcript_path.write_text(text, encoding="utf-8")
     print(f"  文字起こし完了: {len(text)} 文字")
-
-    # チャンク削除
-    chunk_dir = mp3_path.parent / f"{mp3_path.stem}_chunks"
-    if chunk_dir.exists():
-        shutil.rmtree(chunk_dir)
 
     return text
 
@@ -313,6 +295,72 @@ def send_to_discord(text, title=""):
     return True
 
 
+# === Google Drive アップロード ===
+
+def get_drive_service():
+    """OAuth2 リフレッシュトークンで Google Drive API クライアントを取得"""
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials(
+        token=None,
+        refresh_token=GOOGLE_OAUTH_REFRESH_TOKEN,
+        client_id=GOOGLE_OAUTH_CLIENT_ID,
+        client_secret=GOOGLE_OAUTH_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+    return build("drive", "v3", credentials=creds)
+
+
+def upload_to_google_drive(title, date_str, transcript_text, actions_text):
+    """Google Drive に「タイトル_日付」フォルダを作成し、文字起こしとアクションリストを保存"""
+    if not GOOGLE_OAUTH_REFRESH_TOKEN or not GOOGLE_DRIVE_FOLDER_ID:
+        print("  [skip] Google Drive 未設定（GOOGLE_OAUTH_REFRESH_TOKEN / GOOGLE_DRIVE_FOLDER_ID）")
+        return None
+
+    from googleapiclient.http import MediaInMemoryUpload
+
+    service = get_drive_service()
+    folder_name = f"{title}_{date_str}"
+
+    # 同名フォルダが既存か確認
+    query = (
+        f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' "
+        f"and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+    )
+    existing = service.files().list(q=query, fields="files(id)").execute().get("files", [])
+
+    if existing:
+        folder_id = existing[0]["id"]
+        print(f"  Google Drive: 既存フォルダ使用 ({folder_name})")
+    else:
+        folder_meta = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [GOOGLE_DRIVE_FOLDER_ID],
+        }
+        folder = service.files().create(body=folder_meta, fields="id").execute()
+        folder_id = folder["id"]
+        print(f"  Google Drive: フォルダ作成 ({folder_name})")
+
+    # transcript.txt アップロード
+    txt_media = MediaInMemoryUpload(transcript_text.encode("utf-8"), mimetype="text/plain")
+    service.files().create(
+        body={"name": "transcript.txt", "parents": [folder_id]},
+        media_body=txt_media,
+    ).execute()
+
+    # actions.md アップロード
+    md_media = MediaInMemoryUpload(actions_text.encode("utf-8"), mimetype="text/markdown")
+    service.files().create(
+        body={"name": "actions.md", "parents": [folder_id]},
+        media_body=md_media,
+    ).execute()
+
+    print(f"  Google Drive: アップロード完了 (transcript.txt, actions.md)")
+    return folder_id
+
+
 # === パイプライン ===
 
 def process_file(file_info):
@@ -350,12 +398,19 @@ def process_file(file_info):
     # 5. Discord 送信
     send_to_discord(actions, title=display_name)
 
-    # 5. 音声ファイル削除（ディスク節約）
+    # 6. Google Drive アップロード
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        upload_to_google_drive(title, date_str, transcript, actions)
+    except Exception as e:
+        print(f"  [warn] Google Drive アップロード失敗: {type(e).__name__}: {e}")
+
+    # 7. 音声ファイル削除（ディスク節約）
     if mp3_path.exists():
         mp3_path.unlink()
         print(f"  音声ファイル削除済み")
 
-    # 6. 処理済みIDを記録
+    # 8. 処理済みIDを記録
     save_processed_id(file_id)
 
     return actions
@@ -417,8 +472,6 @@ def main():
     if cmd == "auto":
         if not PLAUD_BEARER_TOKEN:
             print("❌ PLAUD_BEARER_TOKEN が未設定"); sys.exit(1)
-        if not OPENAI_API_KEY:
-            print("❌ OPENAI_API_KEY が未設定"); sys.exit(1)
         if not GEMINI_API_KEY:
             print("❌ GEMINI_API_KEY が未設定"); sys.exit(1)
         run_auto()
@@ -438,7 +491,7 @@ def main():
         print(f"\n合計: {len(files)} 件 (処理済み: {len(processed)}件)")
 
     elif cmd == "process" and len(sys.argv) > 2:
-        if not PLAUD_BEARER_TOKEN or not OPENAI_API_KEY or not GEMINI_API_KEY:
+        if not PLAUD_BEARER_TOKEN or not GEMINI_API_KEY:
             print("❌ 必要な環境変数が未設定"); sys.exit(1)
         file_id = sys.argv[2]
         files = list_files(limit=200)
@@ -449,7 +502,7 @@ def main():
             print(f"❌ ファイルが見つかりません: {file_id}")
 
     elif cmd == "transcribe" and len(sys.argv) > 2:
-        if not PLAUD_BEARER_TOKEN or not OPENAI_API_KEY:
+        if not PLAUD_BEARER_TOKEN or not GEMINI_API_KEY:
             print("❌ 必要な環境変数が未設定"); sys.exit(1)
         file_id = sys.argv[2]
         print(f"🎙️ 文字起こし開始: {file_id}")
