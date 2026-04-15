@@ -118,7 +118,7 @@ def rename_plaud_file(file_id, new_name):
     return True
 
 
-def generate_title_gemini(transcript_text):
+def generate_title_gemini(transcript_text, max_retries=3):
     """Gemini で文字起こしから簡潔なタイトルを生成"""
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
@@ -137,12 +137,23 @@ def generate_title_gemini(transcript_text):
 {transcript_text[:5000]}
 """
 
-    response = model.generate_content(prompt)
-    title = response.text.strip().strip('"').strip("「").strip("」")
-    # 30文字制限
-    if len(title) > 30:
-        title = title[:30]
-    return title
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(
+                prompt,
+                request_options={"timeout": 120},
+            )
+            title = response.text.strip().strip('"').strip("「").strip("」")
+            # 30文字制限
+            if len(title) > 30:
+                title = title[:30]
+            return title
+        except Exception as e:
+            print(f"    [retry {attempt + 1}/{max_retries}] タイトル生成: {type(e).__name__}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5 * (attempt + 1))
+            else:
+                raise
 
 
 # === 文字起こし (Gemini) ===
@@ -180,12 +191,15 @@ def transcribe_with_gemini(mp3_path, max_retries=3):
 
     for attempt in range(max_retries):
         try:
-            response = model.generate_content([prompt, uploaded])
+            response = model.generate_content(
+                [prompt, uploaded],
+                request_options={"timeout": 300},
+            )
             return response.text
         except Exception as e:
             print(f"    [retry {attempt + 1}/{max_retries}] {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
-                time.sleep(5 * (attempt + 1))
+                time.sleep(10 * (attempt + 1))
             else:
                 raise
 
@@ -218,7 +232,7 @@ def transcribe_audio(mp3_path, file_id):
 
 # === アクション抽出 (Gemini) ===
 
-def extract_actions_gemini(transcript_text, filename):
+def extract_actions_gemini(transcript_text, filename, max_retries=3):
     """Gemini API で会議のアクションリストを抽出"""
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
@@ -255,8 +269,19 @@ def extract_actions_gemini(transcript_text, filename):
 {transcript_text[:80000]}
 """
 
-    response = model.generate_content(prompt)
-    return response.text
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(
+                prompt,
+                request_options={"timeout": 180},
+            )
+            return response.text
+        except Exception as e:
+            print(f"    [retry {attempt + 1}/{max_retries}] アクション抽出: {type(e).__name__}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(10 * (attempt + 1))
+            else:
+                raise
 
 
 # === Discord 送信 ===
