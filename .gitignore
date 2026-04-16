@@ -1,5 +1,17 @@
 .env
+.env.*
 __pycache__/
 *.pyc
 venv/
 audio_files/
+
+# 認証・機密情報（誤コミット防止）
+*credentials*.json
+*service-account*.json
+*service_account*.json
+*secret*.json
+*oauth*.json
+*-key.json
+stock-workflow-*.json
+token.json
+client_secret*.json
