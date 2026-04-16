@@ -2,14 +2,20 @@ name: Process Plaud Recordings
 
 on:
   schedule:
-    # 毎日 JST 19:00 (UTC 10:00) に実行
-    - cron: '0 10 * * *'
+    # 15分ごとに実行（録音終了後なるべく早く Discord へ）
+    # GitHub Actions cron の最短は 5 分。実行遅延は通常 0〜5 分、高負荷時は 30 分程度になる場合あり
+    - cron: '*/15 * * * *'
   workflow_dispatch:  # 手動実行も可能
+
+# 同時実行を抑止（processed_ids.json のコミット競合を防ぐ）
+concurrency:
+  group: process-plaud-recordings
+  cancel-in-progress: false
 
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     permissions:
       contents: write

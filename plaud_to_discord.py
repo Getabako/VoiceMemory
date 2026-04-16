@@ -118,11 +118,11 @@ def rename_plaud_file(file_id, new_name):
     return True
 
 
-def generate_title_gemini(transcript_text, max_retries=3):
+def generate_title_gemini(transcript_text, max_retries=5):
     """Gemini で文字起こしから簡潔なタイトルを生成"""
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
     prompt = f"""以下の会議の文字起こしの冒頭部分を読み、この会議の内容を表す簡潔なタイトルを1つだけ生成してください。
 
@@ -141,9 +141,11 @@ def generate_title_gemini(transcript_text, max_retries=3):
         try:
             response = model.generate_content(
                 prompt,
-                request_options={"timeout": 120},
+                request_options={"timeout": 180},
             )
-            title = response.text.strip().strip('"').strip("「").strip("」")
+            title = (response.text or "").strip().strip('"').strip("「").strip("」")
+            if not title:
+                raise Exception("タイトルが空です")
             # 30文字制限
             if len(title) > 30:
                 title = title[:30]
@@ -151,14 +153,14 @@ def generate_title_gemini(transcript_text, max_retries=3):
         except Exception as e:
             print(f"    [retry {attempt + 1}/{max_retries}] タイトル生成: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
-                time.sleep(5 * (attempt + 1))
+                time.sleep(5 * (2 ** attempt))
             else:
                 raise
 
 
 # === 文字起こし (Gemini) ===
 
-def transcribe_with_gemini(mp3_path, max_retries=3):
+def transcribe_with_gemini(mp3_path, max_retries=5):
     """Gemini File API + generateContent で音声を文字起こし"""
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
@@ -167,9 +169,12 @@ def transcribe_with_gemini(mp3_path, max_retries=3):
     print(f"  Gemini File API にアップロード中...")
     uploaded = genai.upload_file(str(mp3_path), mime_type="audio/mpeg")
 
-    # アップロード完了を待つ
+    # アップロード完了を待つ（最大 180 秒まで）
+    poll_deadline = time.time() + 180
     while uploaded.state.name == "PROCESSING":
-        time.sleep(2)
+        if time.time() > poll_deadline:
+            raise Exception(f"Gemini ファイルアップロード処理がタイムアウトしました ({uploaded.name})")
+        time.sleep(3)
         uploaded = genai.get_file(uploaded.name)
 
     if uploaded.state.name == "FAILED":
@@ -177,53 +182,67 @@ def transcribe_with_gemini(mp3_path, max_retries=3):
 
     print(f"  アップロード完了: {uploaded.name}")
 
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
     prompt = """以下の音声ファイルを日本語で文字起こししてください。
 
 ## ルール
 - タイムスタンプを付けてください（[HH:MM:SS] 形式）
 - 話者が変わったタイミングで改行してください
+- 話者が複数いる場合は「話者A:」「話者B:」のようにラベルを付けてください（名前が判別できればその名前を使用）
 - 聞き取れない箇所は（聞き取り不明）と記載してください
 - できるだけ正確に、発言内容をそのまま書き起こしてください
 - 「えー」「あのー」などのフィラーは省略して構いません
+- 固有名詞・数字・日付は特に正確に記載してください
 """
 
-    for attempt in range(max_retries):
-        try:
-            response = model.generate_content(
-                [prompt, uploaded],
-                request_options={"timeout": 300},
-            )
-            return response.text
-        except Exception as e:
-            print(f"    [retry {attempt + 1}/{max_retries}] {type(e).__name__}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(10 * (attempt + 1))
-            else:
-                raise
-
-    # アップロード済みファイルを削除
     try:
-        genai.delete_file(uploaded.name)
-    except Exception:
-        pass
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(
+                    [prompt, uploaded],
+                    request_options={"timeout": 600},
+                )
+                text = (response.text or "").strip()
+                if len(text) < 50:
+                    raise Exception(f"文字起こし結果が短すぎます ({len(text)} 文字)")
+                return text
+            except Exception as e:
+                print(f"    [retry {attempt + 1}/{max_retries}] 文字起こし: {type(e).__name__}: {e}")
+                if attempt < max_retries - 1:
+                    # 指数バックオフ: 10, 20, 40, 80 秒
+                    time.sleep(10 * (2 ** attempt))
+                else:
+                    raise
+    finally:
+        # アップロード済みファイルを必ず削除（リソースリーク防止）
+        try:
+            genai.delete_file(uploaded.name)
+        except Exception:
+            pass
 
 
 def transcribe_audio(mp3_path, file_id):
     """Gemini API で文字起こし"""
     transcript_path = TRANSCRIPT_DIR / f"{file_id}.txt"
     if transcript_path.exists():
-        print(f"  [skip] 文字起こし済み")
-        return transcript_path.read_text(encoding="utf-8")
+        cached = transcript_path.read_text(encoding="utf-8").strip()
+        if len(cached) >= 100:
+            print(f"  [skip] 文字起こし済み ({len(cached)} 文字)")
+            return cached
+        else:
+            print(f"  [redo] キャッシュが短すぎるため再実行 ({len(cached)} 文字)")
 
     if not GEMINI_API_KEY or len(GEMINI_API_KEY) < 10:
         raise Exception(f"GEMINI_API_KEY が無効です (長さ: {len(GEMINI_API_KEY)})")
 
     size_mb = mp3_path.stat().st_size / 1024 / 1024
-    print(f"  文字起こし中 (Gemini)... ({size_mb:.1f}MB)")
+    print(f"  文字起こし中 (Gemini 2.5 Flash)... ({size_mb:.1f}MB)")
 
     text = transcribe_with_gemini(mp3_path)
+    if len(text) < 100:
+        raise Exception(f"文字起こし結果が短すぎます ({len(text)} 文字)")
+
     transcript_path.write_text(text, encoding="utf-8")
     print(f"  文字起こし完了: {len(text)} 文字")
 
@@ -232,24 +251,26 @@ def transcribe_audio(mp3_path, file_id):
 
 # === アクション抽出 (Gemini) ===
 
-def extract_actions_gemini(transcript_text, filename, max_retries=3):
-    """Gemini API で会議のアクションリストを抽出"""
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+ACTION_PROMPT_TEMPLATE = """あなたは超一流の会議アシスタントです。以下の会議の文字起こしを深く読み込み、実務で即使える議事録を日本語で出力してください。
 
-    prompt = f"""あなたは優秀な会議アシスタントです。以下の会議の文字起こしを分析し、結果を出力してください。
-
-## 出力ルール
+## 絶対に守るルール
 - 必ず日本語で出力すること
-- Discordで表示するため、Markdown形式で整形すること
-- 具体的なアクションが読み取れない場合でも、重要な議論・合意事項・次のステップをまとめること
-- 話者の名前が特定できる場合はその名前を使い、特定できない場合は「話者A」「話者B」のように区別すること
+- Discord で表示するため Markdown 形式で整形すること
+- **すべての指定セクションを必ず出力すること**（該当情報がなければ「- 特になし」と明記）
+- 話者名が判別できる場合は必ず実名を使用。判別できない場合のみ「話者A」「話者B」と表記
+- 抽象的にまとめず、文字起こしに含まれる具体的な内容（固有名詞・数値・日付・金額・ツール名など）を必ず保持する
+- **「特に具体的なアクションがなかった」と安易に結論付けない**。潜在的な次アクション・検討すべき論点も抽出する
 
-## 出力形式
+## 出力セクション（必ずこの順で、見出しも完全一致）
+
+### 👥 参加者
+- 参加者名と（分かる範囲で）役割を箇条書き
+
+### 📅 日時・場所・コンテキスト
+- 日時 / 場所 / 会議の目的・背景を 1〜3 行で
 
 ### 📋 会議要約
-（会議の目的・主な内容を3〜5行で簡潔に）
+（会議の目的・主な内容・重要な論点・結論を 5〜8 行で、具体的に）
 
 ### ✅ アクションリスト
 **[名前/話者]**
@@ -258,30 +279,74 @@ def extract_actions_gemini(transcript_text, filename, max_retries=3):
 **[名前/話者]**
 - [ ] アクション内容
 
+*明示的なアクションが少ない場合でも、文脈から読み取れる「次に取るべき具体的行動」を必ず提案として記載すること。各参加者につき可能な限り 2 項目以上挙げる。*
+
 ### 📌 決定事項
-- 決定内容1
-- 決定内容2
+- 会議で合意・決定した内容（箇条書き、固有名詞を保持）
 
 ### 💡 補足・注意点
-- 議論中に出た重要な懸念や気づき
+- 議論中に出た重要な懸念・気づき・リスク・未解決の論点
+- 後でフォローアップすべき話題
+
+### 🌱 ネクストステップ候補
+- 次回以降の会議・行動・調査のアイデア（2〜4 個）
 
 ## 文字起こし（会議名: {filename}）
-{transcript_text[:80000]}
+{transcript}
 """
 
+
+def _looks_valid_action_output(text: str) -> bool:
+    """アクション抽出出力が最低限の構造を満たしているかチェック"""
+    if not text or len(text) < 200:
+        return False
+    required_headers = ["### 📋 会議要約", "### ✅ アクションリスト", "### 📌 決定事項"]
+    return all(h in text for h in required_headers)
+
+
+def extract_actions_gemini(transcript_text, filename, max_retries=5):
+    """Gemini API で会議のアクションリストを抽出（品質チェック付き）"""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.5-pro")
+
+    prompt = ACTION_PROMPT_TEMPLATE.format(
+        filename=filename,
+        transcript=transcript_text[:120000],
+    )
+
+    last_error = None
     for attempt in range(max_retries):
         try:
             response = model.generate_content(
                 prompt,
-                request_options={"timeout": 180},
+                request_options={"timeout": 300},
             )
-            return response.text
+            text = (response.text or "").strip()
+            if not _looks_valid_action_output(text):
+                raise Exception(f"出力が構造要件を満たしていません (長さ: {len(text)})")
+            return text
         except Exception as e:
+            last_error = e
             print(f"    [retry {attempt + 1}/{max_retries}] アクション抽出: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
-                time.sleep(10 * (attempt + 1))
+                # 指数バックオフ: 10, 20, 40, 80 秒
+                time.sleep(10 * (2 ** attempt))
             else:
-                raise
+                # 最後の手段: gemini-2.5-flash でフォールバック
+                print(f"    [fallback] gemini-2.5-flash で再試行")
+                try:
+                    fallback_model = genai.GenerativeModel("gemini-2.5-flash")
+                    response = fallback_model.generate_content(
+                        prompt,
+                        request_options={"timeout": 300},
+                    )
+                    text = (response.text or "").strip()
+                    if text:
+                        return text
+                except Exception as fe:
+                    print(f"    [fallback failed] {type(fe).__name__}: {fe}")
+                raise last_error
 
 
 # === Discord 送信 ===
@@ -472,8 +537,12 @@ def run_auto():
             tb = traceback.format_exc()
             print(f"  [error] {f['filename']}: {type(e).__name__}: {e}")
             print(tb)
+            # traceback の末尾5行までDiscordに含める（調査しやすく）
+            tb_tail = "\n".join(tb.strip().split("\n")[-8:])
             send_to_discord(
-                f"⚠️ 処理エラー: {f['filename']}\n```\n{type(e).__name__}: {e}\n```",
+                f"⚠️ 処理エラー: **{f['filename']}** (id=`{f['id']}`)\n"
+                f"```\n{type(e).__name__}: {e}\n\n{tb_tail}\n```\n"
+                f"※ processed_ids には未登録のため、次回実行時に再試行されます。",
                 title="処理エラー通知",
             )
 
