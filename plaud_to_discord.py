@@ -8,6 +8,8 @@ import os
 import sys
 import json
 import time
+import hashlib
+import re
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -33,6 +35,7 @@ BASE_DIR = Path(__file__).parent
 AUDIO_DIR = BASE_DIR / "audio_files"
 TRANSCRIPT_DIR = BASE_DIR / "transcripts"
 PROCESSED_FILE = BASE_DIR / "processed_ids.json"
+PROCESSED_HASHES_FILE = BASE_DIR / "processed_hashes.json"
 AUDIO_DIR.mkdir(exist_ok=True)
 TRANSCRIPT_DIR.mkdir(exist_ok=True)
 
@@ -42,6 +45,7 @@ HEADERS = {
 }
 
 MIN_DURATION_SEC = 300    # 5分未満の録音はスキップ
+DUPLICATE_WINDOW_HOURS = 48  # この時間内に同一文字起こしがあれば重複とみなす
 
 
 # === 処理済みID管理 ===
@@ -58,6 +62,60 @@ def save_processed_id(file_id):
     ids = load_processed_ids()
     ids.add(file_id)
     PROCESSED_FILE.write_text(json.dumps(sorted(ids), ensure_ascii=False), encoding="utf-8")
+
+
+# === 文字起こし重複検出 ===
+
+def compute_transcript_fingerprint(transcript_text: str) -> str:
+    """文字起こしから重複検出用のフィンガープリントを生成
+
+    同じ録音を別 file_id で再処理したケースを検出するため、
+    タイムスタンプ・話者ラベル・空白を除去した冒頭2000文字のSHA256を使う。
+    """
+    # タイムスタンプ [HH:MM:SS] を除去
+    normalized = re.sub(r"\[\d{1,2}:\d{2}:\d{2}\]", "", transcript_text)
+    # 行頭の話者ラベル（例: 「話者A:」「山田さん:」）を除去
+    normalized = re.sub(r"^[^\s:：\n]{1,20}[:：]", "", normalized, flags=re.MULTILINE)
+    # すべての空白・改行を除去
+    normalized = re.sub(r"\s+", "", normalized)
+    # 冒頭2000文字で指紋化（Geminiの揺らぎにある程度耐える）
+    normalized = normalized[:2000]
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def load_processed_hashes():
+    """処理済みフィンガープリントのリストを返す（期限切れは自動除外）"""
+    if not PROCESSED_HASHES_FILE.exists():
+        return []
+    try:
+        entries = json.loads(PROCESSED_HASHES_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"  [warn] processed_hashes.json 読み込み失敗: {e}")
+        return []
+    cutoff = datetime.now().timestamp() - DUPLICATE_WINDOW_HOURS * 3600
+    return [e for e in entries if isinstance(e, dict) and e.get("ts", 0) >= cutoff]
+
+
+def save_processed_hash(file_id: str, fingerprint: str, title: str):
+    """フィンガープリントを追加保存（期限切れエントリは破棄）"""
+    entries = load_processed_hashes()
+    entries.append({
+        "file_id": file_id,
+        "hash": fingerprint,
+        "title": title,
+        "ts": datetime.now().timestamp(),
+    })
+    PROCESSED_HASHES_FILE.write_text(
+        json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def find_duplicate_entry(fingerprint: str):
+    """同一フィンガープリントの既存エントリを返す（なければ None）"""
+    for e in load_processed_hashes():
+        if e.get("hash") == fingerprint:
+            return e
+    return None
 
 
 # === Plaud API ===
@@ -469,6 +527,20 @@ def process_file(file_info):
     # 2. 文字起こし
     transcript = transcribe_audio(mp3_path, file_id)
 
+    # 2.5 重複検出（同じ録音が別 file_id で再登場したケースを検出）
+    fingerprint = compute_transcript_fingerprint(transcript)
+    dup = find_duplicate_entry(fingerprint)
+    if dup:
+        dup_title = dup.get("title", "(不明)")
+        dup_id = dup.get("file_id", "(不明)")
+        print(f"  [skip] 重複検出: {DUPLICATE_WINDOW_HOURS}時間以内に同一内容あり")
+        print(f"         既存: {dup_title} (file_id={dup_id})")
+        # 処理済みとして記録し、Discord/Drive送信はスキップ
+        save_processed_id(file_id)
+        if mp3_path.exists():
+            mp3_path.unlink()
+        return None
+
     # 3. タイトル生成 & Plaud リネーム
     print("  タイトル生成中 (Gemini)...")
     title = generate_title_gemini(transcript)
@@ -500,8 +572,9 @@ def process_file(file_info):
         mp3_path.unlink()
         print(f"  音声ファイル削除済み")
 
-    # 8. 処理済みIDを記録
+    # 8. 処理済みIDとフィンガープリントを記録
     save_processed_id(file_id)
+    save_processed_hash(file_id, fingerprint, title)
 
     return actions
 

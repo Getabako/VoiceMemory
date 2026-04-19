@@ -51,6 +51,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add processed_ids.json transcripts/
+          git add processed_ids.json processed_hashes.json transcripts/
           git diff --cached --quiet || git commit -m "Update processed recordings [skip ci]"
           git push
