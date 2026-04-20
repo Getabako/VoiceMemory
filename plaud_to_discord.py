@@ -10,6 +10,7 @@ import json
 import time
 import hashlib
 import re
+import subprocess
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -36,8 +37,15 @@ AUDIO_DIR = BASE_DIR / "audio_files"
 TRANSCRIPT_DIR = BASE_DIR / "transcripts"
 PROCESSED_FILE = BASE_DIR / "processed_ids.json"
 PROCESSED_HASHES_FILE = BASE_DIR / "processed_hashes.json"
+PROCESSED_AUDIO_HASHES_FILE = BASE_DIR / "processed_audio_hashes.json"
 AUDIO_DIR.mkdir(exist_ok=True)
 TRANSCRIPT_DIR.mkdir(exist_ok=True)
+
+# GitHub Actions 環境かどうか
+IS_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
+# stdout/stderrをラインバッファリング（GitHub Actionsで進捗がリアルタイムに見えるように）
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 HEADERS = {
     "Authorization": PLAUD_BEARER_TOKEN,
@@ -116,6 +124,103 @@ def find_duplicate_entry(fingerprint: str):
         if e.get("hash") == fingerprint:
             return e
     return None
+
+
+# === 音声バイナリハッシュによる重複検出 ===
+# 文字起こし結果は Gemini の揺らぎで完全一致しないことがあるので、
+# ダウンロードした音声バイナリの SHA256 を一次キーとして使う。
+# （同じ録音を Plaud が別 file_id で再登録しても検出できる）
+
+def compute_audio_hash(mp3_path: Path) -> str:
+    """音声ファイルのバイナリSHA256を計算"""
+    h = hashlib.sha256()
+    with open(mp3_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_processed_audio_hashes() -> dict:
+    """{audio_hash: {"file_id": ..., "title": ..., "ts": ...}} を返す"""
+    if not PROCESSED_AUDIO_HASHES_FILE.exists():
+        return {}
+    try:
+        return json.loads(PROCESSED_AUDIO_HASHES_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"  [warn] processed_audio_hashes.json 読み込み失敗: {e}")
+        return {}
+
+
+def save_processed_audio_hash(file_id: str, audio_hash: str, title: str):
+    """音声ハッシュを追加保存"""
+    data = load_processed_audio_hashes()
+    # 既存エントリがあれば上書きせず残す（最初に送信したtitleを保持）
+    if audio_hash not in data:
+        data[audio_hash] = {
+            "file_id": file_id,
+            "title": title,
+            "ts": datetime.now().timestamp(),
+        }
+        PROCESSED_AUDIO_HASHES_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+
+def find_duplicate_by_audio_hash(audio_hash: str):
+    """同一音声ハッシュの既存エントリを返す（なければ None）"""
+    return load_processed_audio_hashes().get(audio_hash)
+
+
+# === GitHub Actions: 1ファイル処理ごとに状態をコミット＆プッシュ ===
+
+def commit_and_push_state(message: str):
+    """GitHub Actions 内で processed_*.json を即座にコミット&プッシュする。
+
+    タイムアウトでジョブが中断されても完了分の結果は保存され、
+    次回実行時に同じファイルを再処理しないようにする。
+    """
+    if not IS_GITHUB_ACTIONS:
+        return
+    try:
+        subprocess.run(
+            ["git", "config", "user.name", "github-actions[bot]"],
+            check=True, cwd=str(BASE_DIR),
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"],
+            check=True, cwd=str(BASE_DIR),
+        )
+        subprocess.run(
+            ["git", "add",
+             "processed_ids.json",
+             "processed_hashes.json",
+             "processed_audio_hashes.json",
+             "transcripts/"],
+            check=False, cwd=str(BASE_DIR),
+        )
+        # 差分がある場合のみコミット
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=str(BASE_DIR),
+        )
+        if diff.returncode == 0:
+            return  # 差分なし
+        subprocess.run(
+            ["git", "commit", "-m", f"{message} [skip ci]"],
+            check=True, cwd=str(BASE_DIR),
+        )
+        # push 前にリモートの最新を取り込む（他ジョブとの競合回避）
+        subprocess.run(
+            ["git", "pull", "--rebase", "origin", "main"],
+            check=False, cwd=str(BASE_DIR),
+        )
+        subprocess.run(
+            ["git", "push", "origin", "HEAD:main"],
+            check=True, cwd=str(BASE_DIR),
+        )
+        print(f"  [git] コミット&プッシュ完了: {message}")
+    except Exception as e:
+        print(f"  [warn] git コミット&プッシュ失敗: {type(e).__name__}: {e}")
 
 
 # === Plaud API ===
@@ -524,21 +629,37 @@ def process_file(file_info):
     # 1. ダウンロード
     mp3_path = download_audio(file_id)
 
+    # 1.5 音声バイナリハッシュで重複検出（同じ録音が別 file_id で再登場したケース）
+    audio_hash = compute_audio_hash(mp3_path)
+    dup_audio = find_duplicate_by_audio_hash(audio_hash)
+    if dup_audio:
+        dup_title = dup_audio.get("title", "(不明)")
+        dup_id = dup_audio.get("file_id", "(不明)")
+        print(f"  [skip] 音声ハッシュ重複: 既存 '{dup_title}' (file_id={dup_id})")
+        # 処理済みとして記録し、Discord/Drive送信はスキップ
+        save_processed_id(file_id)
+        save_processed_audio_hash(file_id, audio_hash, dup_title)
+        if mp3_path.exists():
+            mp3_path.unlink()
+        commit_and_push_state(f"Skip duplicate audio {file_id[:8]}")
+        return None
+
     # 2. 文字起こし
     transcript = transcribe_audio(mp3_path, file_id)
 
-    # 2.5 重複検出（同じ録音が別 file_id で再登場したケースを検出）
+    # 2.5 文字起こしフィンガープリントで重複検出（補助）
     fingerprint = compute_transcript_fingerprint(transcript)
     dup = find_duplicate_entry(fingerprint)
     if dup:
         dup_title = dup.get("title", "(不明)")
         dup_id = dup.get("file_id", "(不明)")
-        print(f"  [skip] 重複検出: {DUPLICATE_WINDOW_HOURS}時間以内に同一内容あり")
+        print(f"  [skip] 文字起こし重複: {DUPLICATE_WINDOW_HOURS}時間以内に同一内容あり")
         print(f"         既存: {dup_title} (file_id={dup_id})")
-        # 処理済みとして記録し、Discord/Drive送信はスキップ
         save_processed_id(file_id)
+        save_processed_audio_hash(file_id, audio_hash, dup_title)
         if mp3_path.exists():
             mp3_path.unlink()
+        commit_and_push_state(f"Skip duplicate transcript {file_id[:8]}")
         return None
 
     # 3. タイトル生成 & Plaud リネーム
@@ -557,6 +678,12 @@ def process_file(file_info):
     result_path = TRANSCRIPT_DIR / f"{file_id}_actions.md"
     result_path.write_text(f"# {display_name}\n\n{actions}", encoding="utf-8")
 
+    # ★ Discord 送信の「前に」処理済みフラグを記録する。
+    #   送信後の工程で例外が出ても再送しないようにするため。
+    save_processed_id(file_id)
+    save_processed_audio_hash(file_id, audio_hash, title)
+    save_processed_hash(file_id, fingerprint, title)
+
     # 5. Discord 送信
     send_to_discord(actions, title=display_name)
 
@@ -572,9 +699,9 @@ def process_file(file_info):
         mp3_path.unlink()
         print(f"  音声ファイル削除済み")
 
-    # 8. 処理済みIDとフィンガープリントを記録
-    save_processed_id(file_id)
-    save_processed_hash(file_id, fingerprint, title)
+    # 8. 1ファイル完了ごとに即コミット&プッシュ。
+    #    タイムアウトで中断されても、完了分は残り重複送信を防げる。
+    commit_and_push_state(f"Processed {title[:30]} ({file_id[:8]})")
 
     return actions
 
@@ -595,8 +722,10 @@ def run_auto():
         print("✅ 新しいファイルはありません")
         return
 
-    # GitHub Actions の時間制限対策: 1回の実行で最大3件まで
-    MAX_PER_RUN = 3
+    # GitHub Actions の時間制限対策: 1回の実行で最大2件まで。
+    # 1件あたり 5〜15 分（文字起こし + アクション抽出）なので、2件なら概ね 30 分以内に完了する。
+    # 完了した時点で即コミット&プッシュするため、タイムアウトしても結果は残る。
+    MAX_PER_RUN = 2
     if len(new_files) > MAX_PER_RUN:
         print(f"📡 {len(new_files)} 件の新規ファイルあり（今回は最新 {MAX_PER_RUN} 件を処理）\n")
         new_files = new_files[:MAX_PER_RUN]

@@ -15,7 +15,9 @@ concurrency:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 1ファイル処理ごとに即コミット&プッシュするため、タイムアウトしても完了分は保存される。
+    # 50分に設定し、余裕を持たせる。
+    timeout-minutes: 50
 
     permissions:
       contents: write
@@ -23,6 +25,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Python スクリプト内から git push するため、認証情報を保持する
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,6 +41,11 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      - name: Configure git for in-script commits
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Run auto processing
         env:
           PLAUD_API_DOMAIN: ${{ secrets.PLAUD_API_DOMAIN }}
@@ -45,12 +56,14 @@ jobs:
           GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
           GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
-        run: python plaud_to_discord.py auto
+          PYTHONUNBUFFERED: "1"
+        # 1ファイル完了ごとにスクリプト内で commit&push するため、外側に Commit ステップは不要
+        run: python -u plaud_to_discord.py auto
 
-      - name: Commit processed IDs
+      - name: Commit any remaining state
+        if: always()
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add processed_ids.json processed_hashes.json transcripts/
+          git add processed_ids.json processed_hashes.json processed_audio_hashes.json transcripts/ 2>/dev/null || true
           git diff --cached --quiet || git commit -m "Update processed recordings [skip ci]"
-          git push
+          git pull --rebase origin main || true
+          git push || true
