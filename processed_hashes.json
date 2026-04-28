@@ -1,38 +1,8 @@
 [
   {
-    "file_id": "78d3a36f0ebc127b0fbdcba8dbb97cad",
-    "hash": "83abd8890e9b10dfc491d04143db92ab6af593ba940525285ed62d34221c04a1",
-    "title": "A・B: GPTs研究会進捗とAI自動化マネタイズ",
-    "ts": 1776763934.410465
-  },
-  {
-    "file_id": "8c034b585c55514c8011b7159b3d3092",
-    "hash": "c3b9315a4c816f35ddc4f0b4521f3bd526ef7d1f99720284e4e5cea005f27b76",
-    "title": "高崎・田中: クロードコード ワークフロービルダー",
-    "ts": 1776815433.829282
-  },
-  {
-    "file_id": "25ad0ee08f61ed94b581160e15b582fb",
-    "hash": "522558c79cfbf88ded8b97ebcb66fec2ff0484fcaae2f4e57fa9c5a64ec99edf",
-    "title": "話者A・B: Unity体験授業の課題と改善策",
-    "ts": 1776862352.532733
-  },
-  {
-    "file_id": "06926b14fbab446bae5089802de9bbab",
-    "hash": "d3524289d552a8ad5a9120ca206def50e8b62b01b650e2c1280bb4d62647827c",
-    "title": "コミュニティ運営・販売戦略",
-    "ts": 1776916167.114292
-  },
-  {
-    "file_id": "3011ec0a4a63871501b1012665629d03",
-    "hash": "c9e5b82d27b05439ee47b4eb9f8d28c0f3aeec0609a7c167d46969cbd1abd9a6",
-    "title": "定例: GPT・Claude最新動向と活用戦略",
-    "ts": 1776916612.704895
-  },
-  {
-    "file_id": "c5ac90d83e8ad8e20ccf3de83bcc6230",
-    "hash": "367eb6002d02abfcaa2bde5b8a79be536811ac8d1190a8ee0186387dadd11976",
-    "title": "システム設計・運用手順・ログの依頼",
-    "ts": 1776924495.567849
+    "file_id": "530bd2f0d21e5198dd30c7b0c3345c35",
+    "hash": "4cac3d53feef94c6eab644dd6cb3914d420414da2a5e945b526dae0e0e9197c7",
+    "title": "先生・女性・榎木: Claude CodeとAI連携活用術",
+    "ts": 1777358792.058486
   }
 ]
