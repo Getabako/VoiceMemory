@@ -53,6 +53,9 @@ HEADERS = {
 }
 
 MIN_DURATION_SEC = 300    # 5分未満の録音はスキップ
+# Gemini 2.5 Flash の入力上限は 1,048,576 トークン。音声は約32トークン/秒なので
+# 理論上限は約9.1時間。安全マージンを取り8時間を超える録音は文字起こし不可として扱う。
+MAX_DURATION_SEC = 8 * 60 * 60
 DUPLICATE_WINDOW_HOURS = 48  # この時間内に同一文字起こしがあれば重複とみなす
 
 
@@ -626,6 +629,29 @@ def process_file(file_info):
     print(f"📁 {filename} ({duration_min:.0f}分)")
     print(f"{'=' * 50}")
 
+    # 0. 長すぎる録音はスキップ（Gemini の 1M トークン上限を超えるため文字起こし不可）
+    duration_sec = file_info["duration"] / 1000
+    if duration_sec > MAX_DURATION_SEC:
+        max_hours = MAX_DURATION_SEC / 3600
+        print(f"  [skip] 録音時間 {duration_min:.0f}分 が上限 {max_hours:.1f}時間 を超過")
+        save_processed_id(file_id)
+        try:
+            send_to_discord(
+                (
+                    f"⚠️ **長時間録音のためスキップしました**\n"
+                    f"- ファイル: `{filename}`\n"
+                    f"- 録音時間: 約 {duration_min:.0f} 分（上限 {max_hours:.1f} 時間）\n"
+                    f"- file_id: `{file_id}`\n"
+                    f"Gemini API の入力トークン上限を超えるため、自動文字起こしできません。"
+                    f"必要なら手動で分割してから再投入してください。"
+                ),
+                title="長時間録音スキップ通知",
+            )
+        except Exception as e:
+            print(f"  [warn] スキップ通知の Discord 送信に失敗: {type(e).__name__}: {e}")
+        commit_and_push_state(f"Skip too-long recording {file_id[:8]}")
+        return None
+
     # 1. ダウンロード
     mp3_path = download_audio(file_id)
 
@@ -739,14 +765,40 @@ def run_auto():
             tb = traceback.format_exc()
             print(f"  [error] {f['filename']}: {type(e).__name__}: {e}")
             print(tb)
-            # traceback の末尾5行までDiscordに含める（調査しやすく）
             tb_tail = "\n".join(tb.strip().split("\n")[-8:])
-            send_to_discord(
-                f"⚠️ 処理エラー: **{f['filename']}** (id=`{f['id']}`)\n"
-                f"```\n{type(e).__name__}: {e}\n\n{tb_tail}\n```\n"
-                f"※ processed_ids には未登録のため、次回実行時に再試行されます。",
-                title="処理エラー通知",
-            )
+
+            # 永続的失敗（再試行しても無駄なもの）は processed_ids に登録して再試行を打ち切る
+            err_text = f"{type(e).__name__}: {e}"
+            permanent_patterns = [
+                "input token count exceeds",
+                "maximum number of tokens",
+                "InvalidArgument",
+                "400 ",
+                "PERMISSION_DENIED",
+                "FAILED_PRECONDITION",
+            ]
+            is_permanent = any(p in err_text for p in permanent_patterns)
+
+            if is_permanent:
+                save_processed_id(f["id"])
+                try:
+                    commit_and_push_state(f"Mark permanent-fail {f['id'][:8]}")
+                except Exception:
+                    pass
+                send_to_discord(
+                    f"⛔ **永続エラー（再試行打ち切り）**: `{f['filename']}` (id=`{f['id']}`)\n"
+                    f"```\n{err_text}\n\n{tb_tail}\n```\n"
+                    f"※ Geminiトークン上限超過などの恒久的失敗のため、processed_ids に登録して以降は再試行しません。"
+                    f"必要なら録音を分割して手動で再投入してください。",
+                    title="永続エラー通知",
+                )
+            else:
+                send_to_discord(
+                    f"⚠️ 処理エラー: **{f['filename']}** (id=`{f['id']}`)\n"
+                    f"```\n{err_text}\n\n{tb_tail}\n```\n"
+                    f"※ 一時的なエラーの可能性があるため、次回実行時に再試行されます。",
+                    title="処理エラー通知",
+                )
 
     print("\n✅ 全処理完了")
 
