@@ -1,11 +1,5 @@
 [
   {
-    "file_id": "98b27096f3f563c8d8cbb7e580d0d47b",
-    "hash": "1c11c26f879f25db8511c5bbf495fe3b7aff8fe8782f096653952df0b98ec79d",
-    "title": "田中・高崎・卓巳: Google I/OとCloud Cod",
-    "ts": 1779233282.046217
-  },
-  {
     "file_id": "0bd027035fa99ecc04d87a65aa56a79a",
     "hash": "836bd17cb143d1f86f46fcfc80659fd6da058689f3e823225bb59b986bf06bba",
     "title": "AI活用システム作成セミナー直前準備",
@@ -16,5 +10,11 @@
     "hash": "498774f117a0d8f83dc90fce398f2eeb6f4fcbcfa8c363effd4545a8c73fddf5",
     "title": "中村・つぼみ・高崎: クロードコードGoogle連携＆AIア",
     "ts": 1779308265.827241
+  },
+  {
+    "file_id": "f6f8e80f4627e50403adfeef2f1a4936",
+    "hash": "04807e1f41a244802d1ee3ed2f510e6e679e94829c3e1fb03532db869760fe03",
+    "title": "高崎: ハピネッツ運用権限移譲",
+    "ts": 1779414710.644914
   }
 ]
