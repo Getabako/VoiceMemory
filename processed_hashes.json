@@ -1,23 +1,5 @@
 [
   {
-    "file_id": "7ceb0319e6a3b1a0e0435629b78fa717",
-    "hash": "d8e0b8d654c1be3baab5ae3b3f1dc02b5c612eaf811b612d96521fe75b36f073",
-    "title": "高田・田中: AI共創コーチと人の巻き込み方",
-    "ts": 1782223826.874246
-  },
-  {
-    "file_id": "e7a279dc1adf9c6028a54702a1f0ce36",
-    "hash": "6825a979254748cab45e2c74a9cae37c62125ad258fadebf1dc5293fb4766416",
-    "title": "田中・高崎: GP研究会 AIマニアック実践",
-    "ts": 1782257869.037756
-  },
-  {
-    "file_id": "86129d2ba1a509bc5d1efc2eef208548",
-    "hash": "e3fc0fc21b458cf8164aa039c654c0b927f1b30c9eb180debfca3c7b873e18bd",
-    "title": "松本・高崎: AIで作る自分専用英語学習",
-    "ts": 1782264957.664564
-  },
-  {
     "file_id": "a8b0c5644654363a2fedb3d2e48aa101",
     "hash": "aeb717ed255657f8a1961dd7d68bf3c869ffae2d7eeedc70c61313dcd5c0fb67",
     "title": "高橋・高崎: 秋田メンター就任依頼と役割説明",
@@ -46,5 +28,11 @@
     "hash": "55e7a6b30037a7295ced7b2247672cfee461fd2c07190b1a44988d80ca32cd71",
     "title": "高崎・おーちゃん: AI画像生成とノート投稿の自動化",
     "ts": 1782381247.240201
+  },
+  {
+    "file_id": "1c99fad2843f6ad78396049340ff0744",
+    "hash": "3a1de3a92338664fa33d5a525e8713bd2117b0bd98a90df3a653ba042f489def",
+    "title": "LINE公式アカウント活用代理店向け勉強会",
+    "ts": 1782449262.33066
   }
 ]
