@@ -1,20 +1,8 @@
 [
   {
-    "file_id": "dedc4b7a37bf3b0885ee108cc66647eb",
-    "hash": "8e569569d1a9459551a5ac05cefca351e693e071d614796f4d537628e73f95a5",
-    "title": "AIデータ学習対策の検討",
-    "ts": 1783485687.025366
-  },
-  {
-    "file_id": "d49dbd7e4092a0c8c81af2bca6e135bf",
-    "hash": "13f73356e082d376e7f48ff1e9c78f14a3fd70313d213c384f32d68337b52ed7",
-    "title": "田中・高崎: GPT緊急ライブ！AI専門特化アプリ開発",
-    "ts": 1783505697.37203
-  },
-  {
-    "file_id": "ebffb0b408b5f0014a30544289e6d259",
-    "hash": "18e6aab4587ad48e76368ed74372b869df6bd6705d9bbeafcf0d815a3afdc45a",
-    "title": "寺田・他: 秋田ベンダー向けLINEアプリデモ戦略",
-    "ts": 1783554718.787273
+    "file_id": "c7fb9077cb685f90733f865d29bb2c18",
+    "hash": "41a987037ece9532863abd1eef897ed623017d666c5cc26d811e149db93d75b9",
+    "title": "たくみくん: GPT 5.6とCodexアプリ統合",
+    "ts": 1783782020.655883
   }
 ]
