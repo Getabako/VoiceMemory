@@ -1,11 +1,10 @@
 name: Process Plaud Recordings
 
+# 2026-09-01: 定期実行は Mac mini の launchd (com.getabako.voice-memory) に移行。
+# Gemini API を撤去し whisper.cpp + codex で処理するため、GitHub Actions では動かない。
+# このワークフローは手動実行のみ残す（実際には mini 側で処理する前提）。
 on:
-  schedule:
-    # 15分ごとに実行（録音終了後なるべく早く Discord へ）
-    # GitHub Actions cron の最短は 5 分。実行遅延は通常 0〜5 分、高負荷時は 30 分程度になる場合あり
-    - cron: '*/15 * * * *'
-  workflow_dispatch:  # 手動実行も可能
+  workflow_dispatch:  # 手動実行のみ
 
 # 同時実行を抑止（processed_ids.json のコミット競合を防ぐ）
 concurrency:

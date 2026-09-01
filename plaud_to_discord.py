@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Plaud → Gemini 文字起こし → Gemini アクション抽出 → Discord 送信 → Google Drive 保存
-GitHub Actions での定期自動実行対応
+Plaud → whisper.cpp（ローカル）文字起こし → codex CLI（サブスク）で議事録 → Discord 送信 → Google Drive 保存
+
+2026-09-01: Gemini API を完全撤去。GitHub Actions ではなく Mac mini の launchd で 15 分ごとに実行する。
+  - 文字起こし: whisper.cpp (brew install whisper-cpp ffmpeg) + ggml-large-v3-turbo
+  - タイトル/議事録: codex exec（有料 API 不使用）
 """
 
 import os
@@ -10,7 +13,9 @@ import json
 import time
 import hashlib
 import re
+import shutil
 import subprocess
+import tempfile
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -26,7 +31,14 @@ except ImportError:
 PLAUD_API_DOMAIN = os.getenv("PLAUD_API_DOMAIN", "https://api-apne1.plaud.ai")
 PLAUD_BEARER_TOKEN = os.getenv("PLAUD_BEARER_TOKEN", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# whisper.cpp（ローカル文字起こし）
+WHISPER_CLI = os.getenv("WHISPER_CLI", "whisper-cli")
+WHISPER_MODEL_PATH = os.getenv(
+    "WHISPER_MODEL_PATH",
+    str(Path.home() / ".cache" / "whisper-cpp" / "ggml-large-v3-turbo.bin"),
+)
+WHISPER_THREADS = os.getenv("WHISPER_THREADS", "8")
+LOCK_FILE = Path(__file__).parent / ".plaud_to_discord.lock"
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
 GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
@@ -52,9 +64,82 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+# === codex CLI（ChatGPTサブスク）共通関数 ===
+# 2026-07-11 Codexサブスク移行、2026-09-01 Gemini フォールバック撤去:
+#   テキスト整形・要約・議事録生成はすべて codex CLI（追加課金なし）で行う。
+#   音声の文字起こしは codex が音声非対応のため whisper.cpp（ローカル・無料）を使う。
+
+CODEX_MODEL = "gpt-5.5"
+# stdin 渡しなので argv 上限は関係ないが、暴走防止のための安全上限（文字数）
+CODEX_MAX_PROMPT_CHARS = 400_000
+
+
+def codex_available() -> bool:
+    """codex CLI が使える環境かどうか"""
+    return shutil.which("codex") is not None
+
+
+def generate_text_codex(prompt: str, timeout_sec: int = 300) -> str:
+    """codex exec でテキスト生成。失敗時は例外を投げる（呼び出し側でリトライ）。
+
+    プロンプトは argv ではなく stdin で渡す（argv 上限約256KBの回避）。
+    最終応答は --output-last-message の一時ファイルから確実に回収する。
+    """
+    if not codex_available():
+        raise RuntimeError("codex CLI が見つかりません")
+    if len(prompt) > CODEX_MAX_PROMPT_CHARS:
+        raise RuntimeError(f"プロンプトが長すぎます ({len(prompt)} 文字 > {CODEX_MAX_PROMPT_CHARS})")
+
+    out_path = None
+    try:
+        fd, out_path = tempfile.mkstemp(prefix="codex-last-", suffix=".txt")
+        os.close(fd)
+        result = subprocess.run(
+            [
+                "codex", "exec",
+                "-m", CODEX_MODEL,
+                "--skip-git-repo-check",
+                "--sandbox", "read-only",
+                "--output-last-message", out_path,
+                "-",  # プロンプトは stdin から読む
+            ],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            cwd=tempfile.gettempdir(),  # リポジトリの AGENTS.md 等を読ませない
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"codex exec 異常終了 (code={result.returncode}): {result.stderr[-500:]}")
+        text = Path(out_path).read_text(encoding="utf-8").strip()
+        if not text:
+            raise RuntimeError("codex exec の最終メッセージが空です")
+        return text
+    finally:
+        if out_path:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+
+
+def generate_text_codex_retry(prompt: str, timeout_sec: int = 300, max_retries: int = 3, label: str = "codex") -> str:
+    """generate_text_codex を指数バックオフ付きでリトライ"""
+    last = None
+    for attempt in range(max_retries):
+        try:
+            return generate_text_codex(prompt, timeout_sec=timeout_sec)
+        except Exception as e:
+            last = e
+            print(f"    [retry {attempt + 1}/{max_retries}] {label}: {type(e).__name__}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(10 * (2 ** attempt))
+    raise last
+
+
 MIN_DURATION_SEC = 300    # 5分未満の録音はスキップ
-# Gemini 2.5 Flash の入力上限は 1,048,576 トークン。音声は約32トークン/秒なので
-# 理論上限は約9.1時間。安全マージンを取り8時間を超える録音は文字起こし不可として扱う。
+# whisper.cpp 自体に長さ上限は無いが、8 時間超は録り忘れ等の可能性が高く
+# 処理時間も長大になるため、安全策としてスキップ扱いにする。
 MAX_DURATION_SEC = 8 * 60 * 60
 DUPLICATE_WINDOW_HOURS = 48  # この時間内に同一文字起こしがあれば重複とみなす
 
@@ -284,12 +369,8 @@ def rename_plaud_file(file_id, new_name):
     return True
 
 
-def generate_title_gemini(transcript_text, max_retries=5):
-    """Gemini で文字起こしから簡潔なタイトルを生成"""
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.5-flash")
-
+def generate_title(transcript_text):
+    """文字起こしから簡潔なタイトルを生成（codex CLI）"""
     prompt = f"""以下の会議の文字起こしの冒頭部分を読み、この会議の内容を表す簡潔なタイトルを1つだけ生成してください。
 
 ## ルール
@@ -302,94 +383,85 @@ def generate_title_gemini(transcript_text, max_retries=5):
 ## 文字起こし（冒頭部分）
 {transcript_text[:5000]}
 """
-
-    for attempt in range(max_retries):
-        try:
-            response = model.generate_content(
-                prompt,
-                request_options={"timeout": 180},
-            )
-            title = (response.text or "").strip().strip('"').strip("「").strip("」")
-            if not title:
-                raise Exception("タイトルが空です")
-            # 30文字制限
-            if len(title) > 30:
-                title = title[:30]
-            return title
-        except Exception as e:
-            print(f"    [retry {attempt + 1}/{max_retries}] タイトル生成: {type(e).__name__}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(5 * (2 ** attempt))
-            else:
-                raise
+    title = generate_text_codex_retry(prompt, timeout_sec=180, label="タイトル生成")
+    title = title.strip().strip('"').strip("「").strip("」")
+    # 複数行返ってきた場合は1行目のみ採用
+    title = title.splitlines()[0].strip() if title else ""
+    if not title:
+        raise RuntimeError("codex のタイトルが空です")
+    return title[:30]
 
 
-# === 文字起こし (Gemini) ===
+# === 文字起こし (whisper.cpp ローカル) ===
 
-def transcribe_with_gemini(mp3_path, max_retries=5):
-    """Gemini File API + generateContent で音声を文字起こし"""
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_API_KEY)
+def _fmt_ts(ms: int) -> str:
+    """ミリ秒 → [HH:MM:SS]"""
+    sec = int(ms // 1000)
+    return f"[{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}]"
 
-    # File API でアップロード
-    print(f"  Gemini File API にアップロード中...")
-    uploaded = genai.upload_file(str(mp3_path), mime_type="audio/mpeg")
 
-    # アップロード完了を待つ（最大 180 秒まで）
-    poll_deadline = time.time() + 180
-    while uploaded.state.name == "PROCESSING":
-        if time.time() > poll_deadline:
-            raise Exception(f"Gemini ファイルアップロード処理がタイムアウトしました ({uploaded.name})")
-        time.sleep(3)
-        uploaded = genai.get_file(uploaded.name)
+def check_whisper_ready():
+    """whisper-cli / ffmpeg / モデルが揃っているか確認（無ければ例外）"""
+    missing = []
+    if shutil.which(WHISPER_CLI) is None:
+        missing.append(f"{WHISPER_CLI} (brew install whisper-cpp)")
+    if shutil.which("ffmpeg") is None:
+        missing.append("ffmpeg (brew install ffmpeg)")
+    if not Path(WHISPER_MODEL_PATH).exists():
+        missing.append(f"モデル {WHISPER_MODEL_PATH} (huggingface ggerganov/whisper.cpp から取得)")
+    if missing:
+        raise RuntimeError("whisper.cpp の準備不足: " + " / ".join(missing))
 
-    if uploaded.state.name == "FAILED":
-        raise Exception(f"Gemini ファイルアップロード失敗: {uploaded.state}")
 
-    print(f"  アップロード完了: {uploaded.name}")
+def transcribe_with_whisper(mp3_path: Path) -> str:
+    """ffmpeg で 16kHz mono wav に変換し、whisper.cpp でタイムスタンプ付き文字起こし"""
+    check_whisper_ready()
+    with tempfile.TemporaryDirectory(prefix="plaud-whisper-") as tmp:
+        wav_path = Path(tmp) / "audio.wav"
+        out_base = Path(tmp) / "out"
+        print("  ffmpeg で wav 変換中...")
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_path),
+             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav_path)],
+            check=True, timeout=600,
+        )
+        print(f"  whisper.cpp で文字起こし中 ({Path(WHISPER_MODEL_PATH).name})...")
+        t0 = time.time()
+        result = subprocess.run(
+            [WHISPER_CLI, "-m", WHISPER_MODEL_PATH, "-l", "ja", "-t", WHISPER_THREADS,
+             "-f", str(wav_path), "-oj", "-of", str(out_base), "-np"],
+            capture_output=True, text=True, timeout=4 * 3600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"whisper-cli 異常終了 (code={result.returncode}): {result.stderr[-800:]}")
+        json_path = Path(str(out_base) + ".json")
+        if not json_path.exists():
+            raise RuntimeError("whisper-cli の JSON 出力が見つかりません")
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        print(f"  whisper 完了 ({time.time() - t0:.0f} 秒)")
 
-    model = genai.GenerativeModel("gemini-2.5-flash")
-
-    prompt = """以下の音声ファイルを日本語で文字起こししてください。
-
-## ルール
-- タイムスタンプを付けてください（[HH:MM:SS] 形式）
-- 話者が変わったタイミングで改行してください
-- 話者が複数いる場合は「話者A:」「話者B:」のようにラベルを付けてください（名前が判別できればその名前を使用）
-- 聞き取れない箇所は（聞き取り不明）と記載してください
-- できるだけ正確に、発言内容をそのまま書き起こしてください
-- 「えー」「あのー」などのフィラーは省略して構いません
-- 固有名詞・数字・日付は特に正確に記載してください
-"""
-
-    try:
-        for attempt in range(max_retries):
-            try:
-                response = model.generate_content(
-                    [prompt, uploaded],
-                    request_options={"timeout": 600},
-                )
-                text = (response.text or "").strip()
-                if len(text) < 50:
-                    raise Exception(f"文字起こし結果が短すぎます ({len(text)} 文字)")
-                return text
-            except Exception as e:
-                print(f"    [retry {attempt + 1}/{max_retries}] 文字起こし: {type(e).__name__}: {e}")
-                if attempt < max_retries - 1:
-                    # 指数バックオフ: 10, 20, 40, 80 秒
-                    time.sleep(10 * (2 ** attempt))
-                else:
-                    raise
-    finally:
-        # アップロード済みファイルを必ず削除（リソースリーク防止）
-        try:
-            genai.delete_file(uploaded.name)
-        except Exception:
-            pass
+    lines = []
+    prev_text = None
+    repeat = 0
+    for seg in data.get("transcription", []):
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        # whisper の幻覚ループ（同一文の連続反復）を間引く
+        if text == prev_text:
+            repeat += 1
+            if repeat >= 2:
+                continue
+        else:
+            repeat = 0
+        prev_text = text
+        offset = (seg.get("offsets") or {}).get("from", 0)
+        lines.append(f"{_fmt_ts(offset)} {text}")
+    return "\n".join(lines).strip()
 
 
 def transcribe_audio(mp3_path, file_id):
-    """Gemini API で文字起こし"""
+    """whisper.cpp で文字起こし（transcripts/ にキャッシュ）"""
     transcript_path = TRANSCRIPT_DIR / f"{file_id}.txt"
     if transcript_path.exists():
         cached = transcript_path.read_text(encoding="utf-8").strip()
@@ -399,13 +471,10 @@ def transcribe_audio(mp3_path, file_id):
         else:
             print(f"  [redo] キャッシュが短すぎるため再実行 ({len(cached)} 文字)")
 
-    if not GEMINI_API_KEY or len(GEMINI_API_KEY) < 10:
-        raise Exception(f"GEMINI_API_KEY が無効です (長さ: {len(GEMINI_API_KEY)})")
-
     size_mb = mp3_path.stat().st_size / 1024 / 1024
-    print(f"  文字起こし中 (Gemini 2.5 Flash)... ({size_mb:.1f}MB)")
+    print(f"  文字起こし開始 ({size_mb:.1f}MB)")
 
-    text = transcribe_with_gemini(mp3_path)
+    text = transcribe_with_whisper(mp3_path)
     if len(text) < 100:
         raise Exception(f"文字起こし結果が短すぎます ({len(text)} 文字)")
 
@@ -424,6 +493,7 @@ ACTION_PROMPT_TEMPLATE = """あなたは超一流の会議アシスタントで�
 - Discord で表示するため Markdown 形式で整形すること
 - **すべての指定セクションを必ず出力すること**（該当情報がなければ「- 特になし」と明記）
 - 話者名が判別できる場合は必ず実名を使用。判別できない場合のみ「話者A」「話者B」と表記
+- 文字起こしには話者ラベルが付いていない。発言内容・呼びかけ・文脈から話者を推定すること（断定できなければ「話者A/B」）
 - 抽象的にまとめず、文字起こしに含まれる具体的な内容（固有名詞・数値・日付・金額・ツール名など）を必ず保持する
 - **「特に具体的なアクションがなかった」と安易に結論付けない**。潜在的な次アクション・検討すべき論点も抽出する
 
@@ -470,49 +540,31 @@ def _looks_valid_action_output(text: str) -> bool:
     return all(h in text for h in required_headers)
 
 
-def extract_actions_gemini(transcript_text, filename, max_retries=5):
-    """Gemini API で会議のアクションリストを抽出（品質チェック付き）"""
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.5-pro")
-
+def extract_actions(transcript_text, filename, max_retries=3):
+    """会議のアクションリスト（議事録）を抽出（codex CLI・構造チェック付き）"""
     prompt = ACTION_PROMPT_TEMPLATE.format(
         filename=filename,
         transcript=transcript_text[:120000],
     )
-
-    last_error = None
+    last_text = ""
     for attempt in range(max_retries):
         try:
-            response = model.generate_content(
-                prompt,
-                request_options={"timeout": 300},
-            )
-            text = (response.text or "").strip()
-            if not _looks_valid_action_output(text):
-                raise Exception(f"出力が構造要件を満たしていません (長さ: {len(text)})")
-            return text
+            text = generate_text_codex(prompt, timeout_sec=600)
         except Exception as e:
-            last_error = e
             print(f"    [retry {attempt + 1}/{max_retries}] アクション抽出: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
-                # 指数バックオフ: 10, 20, 40, 80 秒
                 time.sleep(10 * (2 ** attempt))
-            else:
-                # 最後の手段: gemini-2.5-flash でフォールバック
-                print(f"    [fallback] gemini-2.5-flash で再試行")
-                try:
-                    fallback_model = genai.GenerativeModel("gemini-2.5-flash")
-                    response = fallback_model.generate_content(
-                        prompt,
-                        request_options={"timeout": 300},
-                    )
-                    text = (response.text or "").strip()
-                    if text:
-                        return text
-                except Exception as fe:
-                    print(f"    [fallback failed] {type(fe).__name__}: {fe}")
-                raise last_error
+            continue
+        if _looks_valid_action_output(text):
+            print("    [codex] アクション抽出成功")
+            return text
+        last_text = text
+        print(f"    [retry {attempt + 1}/{max_retries}] アクション抽出: 出力が構造要件を満たしていません (長さ: {len(text)})")
+    if len(last_text) >= 200:
+        # 構造は崩れているが中身はある → そのまま使う（何も出さないより良い）
+        print("    [warn] 構造要件未達のまま採用")
+        return last_text
+    raise RuntimeError("codex による議事録生成に失敗しました")
 
 
 # === Discord 送信 ===
@@ -629,7 +681,7 @@ def process_file(file_info):
     print(f"📁 {filename} ({duration_min:.0f}分)")
     print(f"{'=' * 50}")
 
-    # 0. 長すぎる録音はスキップ（Gemini の 1M トークン上限を超えるため文字起こし不可）
+    # 0. 長すぎる録音はスキップ（録り忘れ等の可能性・処理時間の観点）
     duration_sec = file_info["duration"] / 1000
     if duration_sec > MAX_DURATION_SEC:
         max_hours = MAX_DURATION_SEC / 3600
@@ -642,8 +694,7 @@ def process_file(file_info):
                     f"- ファイル: `{filename}`\n"
                     f"- 録音時間: 約 {duration_min:.0f} 分（上限 {max_hours:.1f} 時間）\n"
                     f"- file_id: `{file_id}`\n"
-                    f"Gemini API の入力トークン上限を超えるため、自動文字起こしできません。"
-                    f"必要なら手動で分割してから再投入してください。"
+                    f"長時間録音は自動処理の対象外です。必要なら手動で分割してから再投入してください。"
                 ),
                 title="長時間録音スキップ通知",
             )
@@ -689,15 +740,15 @@ def process_file(file_info):
         return None
 
     # 3. タイトル生成 & Plaud リネーム
-    print("  タイトル生成中 (Gemini)...")
-    title = generate_title_gemini(transcript)
+    print("  タイトル生成中 (codex)...")
+    title = generate_title(transcript)
     print(f"  生成タイトル: {title}")
     rename_plaud_file(file_id, title)
     display_name = f"{filename} - {title}"
 
-    # 4. アクション抽出 (Gemini)
-    print("  アクション抽出中 (Gemini)...")
-    actions = extract_actions_gemini(transcript, display_name)
+    # 4. アクション抽出 (codex)
+    print("  アクション抽出中 (codex)...")
+    actions = extract_actions(transcript, display_name)
     print("  アクション抽出完了")
 
     # 結果をファイルに保存
@@ -748,9 +799,7 @@ def run_auto():
         print("✅ 新しいファイルはありません")
         return
 
-    # GitHub Actions の時間制限対策: 1回の実行で最大2件まで。
-    # 1件あたり 5〜15 分（文字起こし + アクション抽出）なので、2件なら概ね 30 分以内に完了する。
-    # 完了した時点で即コミット&プッシュするため、タイムアウトしても結果は残る。
+    # 1回の実行で最大2件まで（15分間隔で回るので、残りは次回に持ち越す）。
     MAX_PER_RUN = 2
     if len(new_files) > MAX_PER_RUN:
         print(f"📡 {len(new_files)} 件の新規ファイルあり（今回は最新 {MAX_PER_RUN} 件を処理）\n")
@@ -770,12 +819,8 @@ def run_auto():
             # 永続的失敗（再試行しても無駄なもの）は processed_ids に登録して再試行を打ち切る
             err_text = f"{type(e).__name__}: {e}"
             permanent_patterns = [
-                "input token count exceeds",
-                "maximum number of tokens",
-                "InvalidArgument",
-                "400 ",
-                "PERMISSION_DENIED",
-                "FAILED_PRECONDITION",
+                "文字起こし結果が短すぎます",   # 無音・雑音のみの録音
+                "プロンプトが長すぎます",
             ]
             is_permanent = any(p in err_text for p in permanent_patterns)
 
@@ -788,7 +833,7 @@ def run_auto():
                 send_to_discord(
                     f"⛔ **永続エラー（再試行打ち切り）**: `{f['filename']}` (id=`{f['id']}`)\n"
                     f"```\n{err_text}\n\n{tb_tail}\n```\n"
-                    f"※ Geminiトークン上限超過などの恒久的失敗のため、processed_ids に登録して以降は再試行しません。"
+                    f"※ 再試行しても結果が変わらない失敗のため、processed_ids に登録して以降は再試行しません。"
                     f"必要なら録音を分割して手動で再投入してください。",
                     title="永続エラー通知",
                 )
@@ -808,7 +853,8 @@ def run_auto():
 def main():
     if len(sys.argv) < 2:
         print("使い方:")
-        print("  python3 plaud_to_discord.py auto               # 新規ファイル自動処理 (GitHub Actions用)")
+        print("  python3 plaud_to_discord.py auto               # 新規ファイル自動処理 (mini launchd 用)")
+        print("  python3 plaud_to_discord.py check              # whisper/ffmpeg/モデルの準備確認")
         print("  python3 plaud_to_discord.py list               # ファイル一覧")
         print("  python3 plaud_to_discord.py process <id>       # 1件をフル処理 (DL→文字起こし→アクション→Discord)")
         print("  python3 plaud_to_discord.py transcribe <id>    # 1件を文字起こしのみ")
@@ -820,9 +866,18 @@ def main():
     if cmd == "auto":
         if not PLAUD_BEARER_TOKEN:
             print("❌ PLAUD_BEARER_TOKEN が未設定"); sys.exit(1)
-        if not GEMINI_API_KEY:
-            print("❌ GEMINI_API_KEY が未設定"); sys.exit(1)
-        run_auto()
+        try:
+            check_whisper_ready()
+        except Exception as e:
+            print(f"❌ {e}"); sys.exit(1)
+        # launchd 15分間隔で前回が終わっていない場合の二重起動を防ぐ
+        import fcntl
+        with open(LOCK_FILE, "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("⏭️ 前回の処理がまだ実行中のためスキップ"); sys.exit(0)
+            run_auto()
 
     elif cmd == "list":
         if not PLAUD_BEARER_TOKEN:
@@ -839,8 +894,8 @@ def main():
         print(f"\n合計: {len(files)} 件 (処理済み: {len(processed)}件)")
 
     elif cmd == "process" and len(sys.argv) > 2:
-        if not PLAUD_BEARER_TOKEN or not GEMINI_API_KEY:
-            print("❌ 必要な環境変数が未設定"); sys.exit(1)
+        if not PLAUD_BEARER_TOKEN:
+            print("❌ PLAUD_BEARER_TOKEN が未設定"); sys.exit(1)
         file_id = sys.argv[2]
         files = list_files(limit=200)
         target = next((f for f in files if f["id"] == file_id), None)
@@ -850,12 +905,16 @@ def main():
             print(f"❌ ファイルが見つかりません: {file_id}")
 
     elif cmd == "transcribe" and len(sys.argv) > 2:
-        if not PLAUD_BEARER_TOKEN or not GEMINI_API_KEY:
-            print("❌ 必要な環境変数が未設定"); sys.exit(1)
+        if not PLAUD_BEARER_TOKEN:
+            print("❌ PLAUD_BEARER_TOKEN が未設定"); sys.exit(1)
         file_id = sys.argv[2]
         print(f"🎙️ 文字起こし開始: {file_id}")
         mp3_path = download_audio(file_id)
         transcribe_audio(mp3_path, file_id)
+
+    elif cmd == "check":
+        check_whisper_ready()
+        print(f"✅ whisper-cli={shutil.which(WHISPER_CLI)} ffmpeg={shutil.which('ffmpeg')} model={WHISPER_MODEL_PATH} codex={shutil.which('codex')}")
 
     elif cmd == "discord":
         text = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else "テスト送信"

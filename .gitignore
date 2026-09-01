@@ -15,3 +15,4 @@ audio_files/
 stock-workflow-*.json
 token.json
 client_secret*.json
+.plaud_to_discord.lock
