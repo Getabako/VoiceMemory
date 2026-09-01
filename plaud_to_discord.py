@@ -38,6 +38,11 @@ WHISPER_MODEL_PATH = os.getenv(
     str(Path.home() / ".cache" / "whisper-cpp" / "ggml-large-v3-turbo.bin"),
 )
 WHISPER_THREADS = os.getenv("WHISPER_THREADS", "8")
+# VAD（silero）: 無音・雑音区間を飛ばすことで「ご視聴ありがとうございました」型の幻覚を防ぎ、処理も速くなる
+WHISPER_VAD_MODEL_PATH = os.getenv(
+    "WHISPER_VAD_MODEL_PATH",
+    str(Path.home() / ".cache" / "whisper-cpp" / "ggml-silero-v5.1.2.bin"),
+)
 LOCK_FILE = Path(__file__).parent / ".plaud_to_discord.lock"
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
@@ -409,6 +414,8 @@ def check_whisper_ready():
         missing.append("ffmpeg (brew install ffmpeg)")
     if not Path(WHISPER_MODEL_PATH).exists():
         missing.append(f"モデル {WHISPER_MODEL_PATH} (huggingface ggerganov/whisper.cpp から取得)")
+    if not Path(WHISPER_VAD_MODEL_PATH).exists():
+        missing.append(f"VADモデル {WHISPER_VAD_MODEL_PATH} (huggingface ggml-org/whisper-vad から取得)")
     if missing:
         raise RuntimeError("whisper.cpp の準備不足: " + " / ".join(missing))
 
@@ -429,6 +436,10 @@ def transcribe_with_whisper(mp3_path: Path) -> str:
         t0 = time.time()
         result = subprocess.run(
             [WHISPER_CLI, "-m", WHISPER_MODEL_PATH, "-l", "ja", "-t", WHISPER_THREADS,
+             "--vad", "-vm", WHISPER_VAD_MODEL_PATH, "-sns",
+             # -mc 0: 前セグメントの文脈を引き継がない。引き継ぐと日本語会話で同一文の
+             # 反復ループに入り、以降 30 分分が全部同じ文になる事故が起きた（2026-09-01 実測）
+             "-mc", "0",
              "-f", str(wav_path), "-oj", "-of", str(out_base), "-np"],
             capture_output=True, text=True, timeout=4 * 3600,
         )
@@ -460,6 +471,10 @@ def transcribe_with_whisper(mp3_path: Path) -> str:
     return "\n".join(lines).strip()
 
 
+class NoSpeechError(Exception):
+    """録音に会話がほとんど含まれていない（無音・雑音のみ）"""
+
+
 def transcribe_audio(mp3_path, file_id):
     """whisper.cpp で文字起こし（transcripts/ にキャッシュ）"""
     transcript_path = TRANSCRIPT_DIR / f"{file_id}.txt"
@@ -476,7 +491,7 @@ def transcribe_audio(mp3_path, file_id):
 
     text = transcribe_with_whisper(mp3_path)
     if len(text) < 100:
-        raise Exception(f"文字起こし結果が短すぎます ({len(text)} 文字)")
+        raise NoSpeechError(f"文字起こし結果が短すぎます ({len(text)} 文字): {text[:60]!r}")
 
     transcript_path.write_text(text, encoding="utf-8")
     print(f"  文字起こし完了: {len(text)} 文字")
@@ -722,7 +737,24 @@ def process_file(file_info):
         return None
 
     # 2. 文字起こし
-    transcript = transcribe_audio(mp3_path, file_id)
+    try:
+        transcript = transcribe_audio(mp3_path, file_id)
+    except NoSpeechError as e:
+        # 車内の雑音だけ等、会話が無い録音。エラーではなく処理済みとして静かにスキップ
+        print(f"  [skip] 会話なし: {e}")
+        save_processed_id(file_id)
+        save_processed_audio_hash(file_id, audio_hash, "(会話なし)")
+        if mp3_path.exists():
+            mp3_path.unlink()
+        try:
+            send_to_discord(
+                f"録音 `{filename}`（約 {duration_min:.0f} 分）は会話がほとんど検出されなかったためスキップしました。",
+                title="会話なし録音スキップ",
+            )
+        except Exception as de:
+            print(f"  [warn] スキップ通知の Discord 送信に失敗: {type(de).__name__}: {de}")
+        commit_and_push_state(f"Skip no-speech recording {file_id[:8]}")
+        return None
 
     # 2.5 文字起こしフィンガープリントで重複検出（補助）
     fingerprint = compute_transcript_fingerprint(transcript)
@@ -819,7 +851,6 @@ def run_auto():
             # 永続的失敗（再試行しても無駄なもの）は processed_ids に登録して再試行を打ち切る
             err_text = f"{type(e).__name__}: {e}"
             permanent_patterns = [
-                "文字起こし結果が短すぎます",   # 無音・雑音のみの録音
                 "プロンプトが長すぎます",
             ]
             is_permanent = any(p in err_text for p in permanent_patterns)
